@@ -1,0 +1,16 @@
+[paths]
+input_dir = "test_data"
+processed_dir = "test_data/processed"
+figures_dir = "test_data/figures"
+
+[files]
+sp_data = "Self_Potential_Data_Rio_Grande.csv"
+drift_data = "Self_Potential_Electrode_Drift_Data_Rio_Grande.csv"
+temp_cond_data = "Temperature_Conductivity_Data_Rio_Grande.csv"
+hfem_resistivity = "HFEM_resistivity.csv"
+
+[processing]
+dipole_length_m = 0.5588
+gaussian_sigma = 30
+boxcar_m = 5
+boxcar_iterations = 1
