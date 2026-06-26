@@ -1,49 +1,110 @@
+"""Generate figures from processed self-potential output tables.
+
+This module reads processed CSV products defined by a TOML configuration file
+and generates a standard set of figures for self-potential, integrated
+electric potential, temperature, and conductivity.
+
+The main entry point is `main()`, which parses a config path from the command
+line and writes the figures into the configured figures directory.
+"""
+
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
-import tomllib
+from typing import Any
 
-import pandas as pd
 import matplotlib.pyplot as plt
+import pandas as pd
+import tomllib
+from matplotlib.figure import Figure
 
 
-def load_config(config_path: str | Path = "config.toml") -> dict:
+ConfigDict = dict[str, Any]
+
+
+def load_config(config_path: str | Path = "config.toml") -> ConfigDict:
+    """Load TOML configuration from disk.
+
+    Args:
+        config_path: Path to the TOML configuration file.
+
+    Returns:
+        Parsed configuration dictionary.
+
+    Raises:
+        FileNotFoundError: If the configuration file does not exist.
+        tomllib.TOMLDecodeError: If the TOML file cannot be parsed.
+    """
     config_path = Path(config_path)
     with config_path.open("rb") as f:
         return tomllib.load(f)
 
 
-def ensure_dir(path: Path):
+def ensure_dir(path: Path) -> None:
+    """Create a directory if it does not already exist.
+
+    Args:
+        path: Directory path to create.
+    """
     path.mkdir(parents=True, exist_ok=True)
 
 
 def read_csv(base: Path, name: str) -> pd.DataFrame:
+    """Read a required CSV file from a base directory.
+
+    Args:
+        base: Base directory containing the file.
+        name: File name relative to `base`.
+
+    Returns:
+        Loaded CSV as a pandas DataFrame.
+
+    Raises:
+        FileNotFoundError: If the file does not exist.
+    """
     path = base / name
     if not path.exists():
         raise FileNotFoundError(f"Missing required file: {path}")
     return pd.read_csv(path)
 
 
-def savefig(fig, path: Path):
+def savefig(fig: Figure, path: Path) -> None:
+    """Save and close a Matplotlib figure.
+
+    Args:
+        fig: Figure to save.
+        path: Output image path.
+    """
     fig.tight_layout()
     fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
 
-def plot_gradient_sp_segments(df: pd.DataFrame, figures_dir: Path):
+def plot_gradient_sp_segments(df: pd.DataFrame, figures_dir: Path) -> None:
+    """Plot drift-corrected gradient self-potential by segment.
+
+    Args:
+        df: DataFrame containing the processed gradient SP table.
+        figures_dir: Output directory for figure files.
+    """
     fig, ax = plt.subplots(figsize=(12, 5))
-    colors = {1: "k", 2: "b", 3: "c", 4: "m"}
-    labels = {1: "Segment 1", 2: "Segment 2", 3: "Segment 3", 4: "Segment 4"}
+    colors: dict[int, str] = {1: "k", 2: "b", 3: "c", 4: "m"}
+    labels: dict[int, str] = {
+        1: "Segment 1",
+        2: "Segment 2",
+        3: "Segment 3",
+        4: "Segment 4",
+    }
 
     for seg in sorted(df["segment_id"].unique()):
         d = df[df["segment_id"] == seg].copy()
         ax.plot(
             d["segment_distance_km"],
             d["drift_corrected_SP_mV"],
-            color=colors.get(seg, None),
+            color=colors.get(int(seg), None),
             lw=1.2,
-            label=labels.get(seg, f"Segment {seg}"),
+            label=labels.get(int(seg), f"Segment {seg}"),
         )
 
     ax.set_xlabel("Segment Distance (km)")
@@ -56,7 +117,13 @@ def plot_gradient_sp_segments(df: pd.DataFrame, figures_dir: Path):
     savefig(fig, figures_dir / "figure_sp_segments.png")
 
 
-def plot_interpretation_segments(df: pd.DataFrame, figures_dir: Path):
+def plot_interpretation_segments(df: pd.DataFrame, figures_dir: Path) -> None:
+    """Plot full and low-frequency SP signals for interpretation segments.
+
+    Args:
+        df: DataFrame containing the processed electric potential table.
+        figures_dir: Output directory for figure files.
+    """
     fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=False)
 
     upstream = df[df["segment_id"].isin([1, 2])].copy()
@@ -106,13 +173,19 @@ def plot_interpretation_segments(df: pd.DataFrame, figures_dir: Path):
     savefig(fig, figures_dir / "figure_interpretation_segments.png")
 
 
-def plot_integrated_potential(df: pd.DataFrame, figures_dir: Path):
+def plot_integrated_potential(df: pd.DataFrame, figures_dir: Path) -> None:
+    """Plot integrated electric potential components for both segment groups.
+
+    Args:
+        df: DataFrame containing the processed electric potential table.
+        figures_dir: Output directory for figure files.
+    """
     fig, axes = plt.subplots(2, 2, figsize=(12, 8), sharex=False)
 
     upstream = df[df["segment_id"].isin([1, 2])].copy()
     downstream = df[df["segment_id"].isin([3, 4])].copy()
 
-    series = [
+    series: list[tuple[str, str]] = [
         ("V_full", "Integrated Electric Potential: Full Signal"),
         ("VL_lowfreq", "Integrated Electric Potential: Low Frequency"),
         ("VH_highfreq", "Integrated Electric Potential: High Frequency"),
@@ -138,9 +211,15 @@ def plot_integrated_potential(df: pd.DataFrame, figures_dir: Path):
     savefig(fig, figures_dir / "figure_integrated_potential.png")
 
 
-def plot_temp_cond(df: pd.DataFrame, figures_dir: Path):
+def plot_temp_cond(df: pd.DataFrame, figures_dir: Path) -> None:
+    """Plot raw temperature and conductivity change by segment.
+
+    Args:
+        df: DataFrame containing the processed temperature/conductivity table.
+        figures_dir: Output directory for figure files.
+    """
     fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=False)
-    colors = {1: "k", 2: "r", 3: "g", 4: "b"}
+    colors: dict[int, str] = {1: "k", 2: "r", 3: "g", 4: "b"}
 
     for seg in sorted(df["segment_id"].unique()):
         d = df[df["segment_id"] == seg].copy()
@@ -148,7 +227,7 @@ def plot_temp_cond(df: pd.DataFrame, figures_dir: Path):
         axes[0].plot(
             d["segment_distance_m"] / 1000.0,
             d["temp_degC"] - d["temp_degC"].iloc[0],
-            color=colors.get(seg, None),
+            color=colors.get(int(seg), None),
             lw=1.2,
             label=f"Segment {seg}",
         )
@@ -156,7 +235,7 @@ def plot_temp_cond(df: pd.DataFrame, figures_dir: Path):
         axes[1].plot(
             d["segment_distance_m"] / 1000.0,
             d["cond_uS_cm"] - d["cond_uS_cm"].iloc[0],
-            color=colors.get(seg, None),
+            color=colors.get(int(seg), None),
             lw=1.2,
             label=f"Segment {seg}",
         )
@@ -178,7 +257,16 @@ def plot_temp_cond(df: pd.DataFrame, figures_dir: Path):
     savefig(fig, figures_dir / "figure_temp_cond.png")
 
 
-def run_all_plots(config_path: str | Path = "config.toml"):
+def run_all_plots(config_path: str | Path = "config.toml") -> None:
+    """Generate all standard figures from processed output tables.
+
+    Args:
+        config_path: Path to the TOML configuration file.
+
+    Raises:
+        FileNotFoundError: If one or more required CSV inputs are missing.
+        tomllib.TOMLDecodeError: If the TOML file cannot be parsed.
+    """
     cfg = load_config(config_path)
 
     processed_dir = Path(cfg["paths"]["processed_dir"])
@@ -197,7 +285,8 @@ def run_all_plots(config_path: str | Path = "config.toml"):
     print(f"Wrote figures to {figures_dir}")
 
 
-def main():
+def main() -> None:
+    """Parse command-line arguments and generate figures."""
     parser = argparse.ArgumentParser(
         description="Plot processed self-potential outputs from config.toml"
     )

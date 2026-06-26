@@ -1,91 +1,157 @@
-import csv
-from datetime import datetime, timezone
+"""Log Arrow GNSS NMEA data to CSV at a fixed interval.
+
+This script reads NMEA sentences from a serial-connected GNSS receiver,
+tracks the most recent dilution of precision (DOP) values from GSA messages,
+and writes position records from GGA messages to a CSV file.
+
+The output CSV includes:
+- PC UTC timestamp
+- NMEA timestamp
+- Latitude and longitude in decimal degrees
+- Altitude in meters
+- Fix quality
+- Number of satellites
+- PDOP, HDOP, and VDOP
+- The raw NMEA sentence
+
+The script runs until interrupted by the user.
+"""
 
 import csv
 import time
 from datetime import datetime, timezone
-import serial
+
 import pynmea2
+import serial
+
 
 PORT = "COM5"
 BAUD = 9600
 OUT_CSV = "arrow_log.csv"
-LOG_INTERVAL_SEC = 5.0   # write one row every 5 seconds
+LOG_INTERVAL_SEC = 1.0
+
 
 def dm_to_decimal(value, direction):
+    """Convert NMEA degrees-minutes coordinates to decimal degrees.
+
+    Args:
+        value: Coordinate value in NMEA degrees-minutes format, such as
+            "4530.1234". May be None or an empty string.
+        direction: Cardinal direction indicator, usually one of
+            "N", "S", "E", or "W".
+
+    Returns:
+        The coordinate in decimal degrees as a float, or None if the input
+        value is empty.
+    """
     if value in (None, ""):
         return None
-    v = float(value)
-    degrees = int(v / 100)
-    minutes = v - degrees * 100
-    dec = degrees + minutes / 60.0
+
+    numeric_value = float(value)
+    degrees = int(numeric_value / 100)
+    minutes = numeric_value - degrees * 100
+    decimal_degrees = degrees + minutes / 60.0
+
     if direction in ("S", "W"):
-        dec *= -1
-    return dec
+        decimal_degrees *= -1
 
-latest_pdop = None
-latest_hdop = None
-latest_vdop = None
-last_log_time = 0.0
+    return decimal_degrees
 
-try:
-    with serial.Serial(PORT, BAUD, timeout=2) as ser, open(OUT_CSV, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "pc_utc_time",
-            "nmea_time",
-            "lat_dd",
-            "lon_dd",
-            "alt_m",
-            "fix_quality",
-            "num_sats",
-            "pdop",
-            "hdop",
-            "vdop",
-            "raw_sentence"
-        ])
 
-        print(f"Logging started on {PORT}. Interval = {LOG_INTERVAL_SEC} sec. Press Ctrl+C to stop.")
+def main():
+    """Read GNSS NMEA sentences from serial and log selected fields to CSV.
+
+    The function listens for GSA and GGA messages from the configured serial
+    port. GSA messages update the most recent DOP values, and GGA messages
+    are written to the CSV file no more frequently than LOG_INTERVAL_SEC.
+
+    Raises:
+        serial.SerialException: If the serial port cannot be opened or read.
+        OSError: If the output CSV file cannot be created or written.
+    """
+    latest_pdop = None
+    latest_hdop = None
+    latest_vdop = None
+    last_log_time = 0.0
+
+    with serial.Serial(PORT, BAUD, timeout=2) as serial_connection, open(
+        OUT_CSV, "w", newline=""
+    ) as output_file:
+        writer = csv.writer(output_file)
+        writer.writerow(
+            [
+                "pc_utc_time",
+                "nmea_time",
+                "lat_dd",
+                "lon_dd",
+                "alt_m",
+                "fix_quality",
+                "num_sats",
+                "pdop",
+                "hdop",
+                "vdop",
+                "raw_sentence",
+            ]
+        )
+
+        print(
+            f"Logging started on {PORT}. "
+            f"Interval = {LOG_INTERVAL_SEC} sec. "
+            "Press Ctrl+C to stop."
+        )
 
         while True:
-            line = ser.readline().decode("ascii", errors="ignore").strip()
+            line = serial_connection.readline().decode(
+                "ascii", errors="ignore"
+            ).strip()
+
             if not line.startswith("$"):
                 continue
 
             try:
-                msg = pynmea2.parse(line)
+                message = pynmea2.parse(line)
             except pynmea2.ParseError:
                 continue
 
-            if msg.sentence_type == "GSA":
-                latest_pdop = float(msg.pdop) if msg.pdop else None
-                latest_hdop = float(msg.hdop) if msg.hdop else None
-                latest_vdop = float(msg.vdop) if msg.vdop else None
+            if message.sentence_type == "GSA":
+                latest_pdop = float(message.pdop) if message.pdop else None
+                latest_hdop = float(message.hdop) if message.hdop else None
+                latest_vdop = float(message.vdop) if message.vdop else None
 
-            elif msg.sentence_type == "GGA":
-                now = time.time()
+            elif message.sentence_type == "GGA":
+                current_time = time.time()
 
-                if now - last_log_time < LOG_INTERVAL_SEC:
+                if current_time - last_log_time < LOG_INTERVAL_SEC:
                     continue
 
-                lat = dm_to_decimal(msg.lat, msg.lat_dir)
-                lon = dm_to_decimal(msg.lon, msg.lon_dir)
+                latitude_dd = dm_to_decimal(message.lat, message.lat_dir)
+                longitude_dd = dm_to_decimal(message.lon, message.lon_dir)
 
-                writer.writerow([
-                    datetime.now(timezone.utc).isoformat(),
-                    str(msg.timestamp) if msg.timestamp else "",
-                    lat,
-                    lon,
-                    msg.altitude,
-                    msg.gps_qual,
-                    msg.num_sats,
-                    float(msg.horizontal_dil) if msg.horizontal_dil else latest_hdop,
-                    latest_pdop,
-                    latest_vdop,
-                    line
-                ])
-                f.flush()
-                last_log_time = now
+                writer.writerow(
+                    [
+                        datetime.now(timezone.utc).isoformat(),
+                        str(message.timestamp) if message.timestamp else "",
+                        latitude_dd,
+                        longitude_dd,
+                        message.altitude,
+                        message.gps_qual,
+                        message.num_sats,
+                        (
+                            float(message.horizontal_dil)
+                            if message.horizontal_dil
+                            else latest_hdop
+                        ),
+                        latest_pdop,
+                        latest_vdop,
+                        line,
+                    ]
+                )
+                output_file.flush()
+                last_log_time = current_time
 
-except KeyboardInterrupt:
-    print("\nLogging stopped by user.")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nLogging stopped by user.")
