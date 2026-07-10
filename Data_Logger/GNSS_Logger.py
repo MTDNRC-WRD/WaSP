@@ -56,6 +56,11 @@ def utc_now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
+def local_now_iso():
+    """Return current local PC time in ISO format with local timezone offset."""
+    return datetime.now().astimezone().isoformat()
+
+
 def resolve_output_csv_path(base_name):
     """Return a dated, non-overwriting CSV path.
 
@@ -126,6 +131,7 @@ def main():
         writer = csv.writer(output_file)
         writer.writerow(
             [
+                "pc_local_time",
                 "pc_utc_time",
                 "nmea_time",
                 "lat_dd",
@@ -187,6 +193,7 @@ def main():
 
                 writer.writerow(
                     [
+                        local_now_iso(),
                         utc_now_iso(),
                         str(message.timestamp) if message.timestamp else "",
                         latitude_dd,
@@ -194,12 +201,12 @@ def main():
                         message.altitude,
                         message.gps_qual,
                         message.num_sats,
+                        latest_pdop,
                         (
                             float(message.horizontal_dil)
                             if message.horizontal_dil
                             else latest_hdop
                         ),
-                        latest_pdop,
                         latest_vdop,
                         line,
                     ]
