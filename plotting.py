@@ -2,7 +2,9 @@
 
 This module reads processed CSV products defined by a TOML configuration file
 and generates a standard set of figures for self-potential, integrated
-electric potential, temperature, and conductivity.
+electric potential, temperature, and conductivity. Missing CSV inputs are
+treated as optional: the script prints a terminal warning and skips any plots
+that depend on unavailable files.
 
 The main entry point is `main()`, which parses a config path from the command
 line and writes the figures into the configured figures directory.
@@ -18,7 +20,6 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import tomllib
 from matplotlib.figure import Figure
-
 
 ConfigDict = dict[str, Any]
 
@@ -50,22 +51,25 @@ def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def read_csv(base: Path, name: str) -> pd.DataFrame:
-    """Read a required CSV file from a base directory.
+def read_csv_if_exists(base: Path, name: str) -> pd.DataFrame | None:
+    """Read a CSV file if it exists.
 
     Args:
         base: Base directory containing the file.
         name: File name relative to `base`.
 
     Returns:
-        Loaded CSV as a pandas DataFrame.
+        The loaded CSV as a pandas DataFrame if the file exists; otherwise
+        `None`.
 
-    Raises:
-        FileNotFoundError: If the file does not exist.
+    Notes:
+        Missing files are treated as optional. A warning is printed to the
+        terminal and the corresponding plots should be skipped by the caller.
     """
     path = base / name
     if not path.exists():
-        raise FileNotFoundError(f"Missing required file: {path}")
+        print(f"[WARN] Missing input file, skipping plots that depend on it: {path}")
+        return None
     return pd.read_csv(path)
 
 
@@ -123,50 +127,76 @@ def plot_interpretation_segments(df: pd.DataFrame, figures_dir: Path) -> None:
     Args:
         df: DataFrame containing the processed electric potential table.
         figures_dir: Output directory for figure files.
+
+    Notes:
+        This function expects segment groups 1-2 and 3-4. If one group is not
+        present, the corresponding subplot is annotated instead of failing.
     """
     fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=False)
 
     upstream = df[df["segment_id"].isin([1, 2])].copy()
     downstream = df[df["segment_id"].isin([3, 4])].copy()
 
-    axes[0].plot(
-        range(len(upstream)),
-        upstream["SPmV_drift_corrected"],
-        "k",
-        lw=1.0,
-        label="Full Signal",
-    )
-    axes[0].plot(
-        range(len(upstream)),
-        upstream["DVL_lowfreq"],
-        "r",
-        lw=1.0,
-        label="Low Frequency",
-    )
-    axes[0].set_title("Interpretation Segment 1–2")
+    if not upstream.empty:
+        axes[0].plot(
+            range(len(upstream)),
+            upstream["SPmV_drift_corrected"],
+            "k",
+            lw=1.0,
+            label="Full Signal",
+        )
+        axes[0].plot(
+            range(len(upstream)),
+            upstream["DVL_lowfreq"],
+            "r",
+            lw=1.0,
+            label="Low Frequency",
+        )
+        axes[0].legend()
+    else:
+        axes[0].text(
+            0.5,
+            0.5,
+            "No Segment 1-2 data found",
+            ha="center",
+            va="center",
+            transform=axes[0].transAxes,
+        )
+
+    axes[0].set_title("Interpretation Segment 1-2")
     axes[0].set_ylabel("Voltage (mV)")
-    axes[0].legend()
     axes[0].minorticks_on()
     axes[0].grid(alpha=0.2)
 
-    axes[1].plot(
-        range(len(downstream)),
-        downstream["SPmV_drift_corrected"],
-        "k",
-        lw=1.0,
-        label="Full Signal",
-    )
-    axes[1].plot(
-        range(len(downstream)),
-        downstream["DVL_lowfreq"],
-        "r",
-        lw=1.0,
-        label="Low Frequency",
-    )
-    axes[1].set_title("Interpretation Segment 3–4")
+    if not downstream.empty:
+        axes[1].plot(
+            range(len(downstream)),
+            downstream["SPmV_drift_corrected"],
+            "k",
+            lw=1.0,
+            label="Full Signal",
+        )
+        axes[1].plot(
+            range(len(downstream)),
+            downstream["DVL_lowfreq"],
+            "r",
+            lw=1.0,
+            label="Low Frequency",
+        )
+        axes[1].legend()
+    else:
+        axes[1].text(
+            0.5,
+            0.5,
+            "No Segment 3-4 data found",
+            ha="center",
+            va="center",
+            transform=axes[1].transAxes,
+        )
+
+    axes[1].set_title("Interpretation Segment 3-4")
     axes[1].set_xlabel("Sample Index")
     axes[1].set_ylabel("Voltage (mV)")
-    axes[1].legend()
     axes[1].minorticks_on()
     axes[1].grid(alpha=0.2)
 
@@ -179,6 +209,11 @@ def plot_integrated_potential(df: pd.DataFrame, figures_dir: Path) -> None:
     Args:
         df: DataFrame containing the processed electric potential table.
         figures_dir: Output directory for figure files.
+
+    Notes:
+        This function expects segment groups 1-2 and 3-4. If one or both
+        groups are missing, the available data are plotted and empty panels are
+        annotated.
     """
     fig, axes = plt.subplots(2, 2, figsize=(12, 8), sharex=False)
 
@@ -193,18 +228,37 @@ def plot_integrated_potential(df: pd.DataFrame, figures_dir: Path) -> None:
     ]
 
     for ax, (col, title) in zip(axes.flat, series):
-        ax.plot(range(len(upstream)), upstream[col], "k", lw=1.0, label="Segment 1–2")
-        ax.plot(
-            range(len(downstream)),
-            downstream[col],
-            color="0.35",
-            lw=1.0,
-            label="Segment 3–4",
-        )
+        if not upstream.empty:
+            ax.plot(
+                range(len(upstream)),
+                upstream[col],
+                "k",
+                lw=1.0,
+                label="Segment 1-2",
+            )
+        if not downstream.empty:
+            ax.plot(
+                range(len(downstream)),
+                downstream[col],
+                color="0.35",
+                lw=1.0,
+                label="Segment 3-4",
+            )
+        if upstream.empty and downstream.empty:
+            ax.text(
+                0.5,
+                0.5,
+                "No data found",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
+        else:
+            ax.legend()
+
         ax.set_title(title)
         ax.set_xlabel("Sample Index")
         ax.set_ylabel("Voltage (mV)")
-        ax.legend()
         ax.minorticks_on()
         ax.grid(alpha=0.2)
 
@@ -258,14 +312,14 @@ def plot_temp_cond(df: pd.DataFrame, figures_dir: Path) -> None:
 
 
 def run_all_plots(config_path: str | Path = "config.toml") -> None:
-    """Generate all standard figures from processed output tables.
+    """Generate all available standard figures from processed output tables.
 
     Args:
         config_path: Path to the TOML configuration file.
 
-    Raises:
-        FileNotFoundError: If one or more required CSV inputs are missing.
-        tomllib.TOMLDecodeError: If the TOML file cannot be parsed.
+    Notes:
+        Missing CSV files do not stop execution. The script prints warnings to
+        the terminal and skips any plots that depend on unavailable inputs.
     """
     cfg = load_config(config_path)
 
@@ -273,16 +327,35 @@ def run_all_plots(config_path: str | Path = "config.toml") -> None:
     figures_dir = Path(cfg["paths"]["figures_dir"])
     ensure_dir(figures_dir)
 
-    grad = read_csv(processed_dir, "Gradient_Self_Potential_python.csv")
-    pot = read_csv(processed_dir, "Electric_Potential_python.csv")
-    tc = read_csv(processed_dir, "Temperature_Conductivity_python.csv")
+    grad = read_csv_if_exists(processed_dir, "Gradient_Self_Potential_python.csv")
+    pot = read_csv_if_exists(processed_dir, "Electric_Potential_python.csv")
+    tc = read_csv_if_exists(processed_dir, "Temperature_Conductivity_python.csv")
 
-    plot_gradient_sp_segments(grad, figures_dir)
-    plot_interpretation_segments(pot, figures_dir)
-    plot_integrated_potential(pot, figures_dir)
-    plot_temp_cond(tc, figures_dir)
+    wrote_any = False
 
-    print(f"Wrote figures to {figures_dir}")
+    if grad is not None:
+        plot_gradient_sp_segments(grad, figures_dir)
+        wrote_any = True
+    else:
+        print("[WARN] Skipped gradient SP plot.")
+
+    if pot is not None:
+        plot_interpretation_segments(pot, figures_dir)
+        plot_integrated_potential(pot, figures_dir)
+        wrote_any = True
+    else:
+        print("[WARN] Skipped interpretation and integrated potential plots.")
+
+    if tc is not None:
+        plot_temp_cond(tc, figures_dir)
+        wrote_any = True
+    else:
+        print("[WARN] Skipped temperature/conductivity plots.")
+
+    if wrote_any:
+        print(f"[INFO] Wrote available figures to {figures_dir}")
+    else:
+        print(f"[WARN] No input CSV files found in {processed_dir}; no figures were created.")
 
 
 def main() -> None:

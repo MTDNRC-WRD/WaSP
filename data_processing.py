@@ -11,6 +11,17 @@ processing steps originally translated from MATLAB code. It supports:
 * Segment-wise drift correction and partitioning of SP signals.
 * Temperature and conductivity drift correction (optional).
 
+Drift correction
+----------------
+Electrode drift is a clock-driven process, so the drift line is fit against
+ELAPSED SECONDS rather than sample index. Repeat occupations of a drift
+station (``DriftMeasurementLocation`` values such as ``eddy_1``, ``eddy_2``)
+are first collapsed to one mean voltage and one mean time per station, then a
+least-squares line is fit through those station means and evaluated at each
+SP sample's own timestamp. This keeps the correction in mV/second and avoids
+the sample-index scaling error that arises when a fit built on a few dozen
+drift readings is applied across thousands of SP samples.
+
 The main entry point is `process_code()`, which reads raw CSV inputs, applies
 all processing steps, and optionally writes several processed CSV products.
 
@@ -86,6 +97,70 @@ GAUSS_SIGMA = int(CFG["processing"]["gaussian_sigma"])
 BOXCAR_M = int(CFG["processing"]["boxcar_m"])
 BOXCAR_ITS = int(CFG["processing"]["boxcar_iterations"])
 
+# Minimum number of distinct drift stations needed to fit a sloped drift line.
+# With fewer, a constant (mean) offset is removed instead.
+DRIFT_MIN_STATIONS_FOR_FIT = 2
+
+
+# =============================================================================
+# COLUMN / TIME HELPERS
+# =============================================================================
+
+def resolve_column(
+    df: pd.DataFrame,
+    *candidates: str,
+    index_fallback: int | None = None,
+    label: str = "",
+) -> str:
+    """Return the actual column name matching one of `candidates` (case-insensitive).
+
+    Falls back to a positional index if provided, so legacy files without the
+    expected headers still load.
+    """
+    lookup = {str(c).strip().lower(): c for c in df.columns}
+    for cand in candidates:
+        key = cand.strip().lower()
+        if key in lookup:
+            return lookup[key]
+
+    if index_fallback is not None and index_fallback < df.shape[1]:
+        return df.columns[index_fallback]
+
+    raise ValueError(
+        f"Could not resolve {label or 'column'} from {candidates}. "
+        f"Columns found: {list(df.columns)}"
+    )
+
+
+def parse_clock_seconds(values: ArrayLike) -> FloatArray:
+    """Parse clock strings like '11:25:32' into seconds since midnight.
+
+    Monotonically unwraps a midnight rollover so elapsed time stays increasing.
+    Unparseable entries become NaN.
+    """
+    series = pd.Series(values).astype(str).str.strip()
+    deltas = pd.to_timedelta(series, errors="coerce")
+
+    # np.array(..., copy=True) guarantees a writable buffer; to_numpy() may
+    # return a read-only view of pandas' internal storage.
+    secs = np.array(deltas.dt.total_seconds(), dtype=float, copy=True)
+
+    day_offset = 0.0
+    prev = np.nan
+    for i, v in enumerate(secs):
+        if np.isnan(v):
+            continue
+        if not np.isnan(prev) and v < prev - 1.0:
+            day_offset += 86400.0
+        prev = v
+        secs[i] = v + day_offset
+
+    return secs
+
+
+# =============================================================================
+# SIGNAL PROCESSING FUNCTIONS
+# =============================================================================
 
 def gauss_filter(x: ArrayLike, sigma: int) -> FloatArray:
     x = np.asarray(x, dtype=float)
@@ -194,7 +269,12 @@ def ls_poly(order: int, x: ArrayLike, y: ArrayLike) -> tuple[FloatArray, float, 
 
     normal_matrix = design_matrix.T @ design_matrix
     rhs = design_matrix.T @ y
-    coeffs = np.linalg.solve(normal_matrix, rhs)
+
+    try:
+        coeffs = np.linalg.solve(normal_matrix, rhs)
+    except np.linalg.LinAlgError:
+        # Degenerate design (e.g. all x identical) - fall back to least squares
+        coeffs, *_ = np.linalg.lstsq(design_matrix, y, rcond=None)
 
     fitted = design_matrix @ coeffs
 
@@ -293,6 +373,79 @@ def cond_to_sc(S: ArrayLike, T: ArrayLike) -> FloatArray:
     return conductivity / (1.0 + 0.002 * (temperature - 25.0))
 
 
+# =============================================================================
+# DRIFT CORRECTION
+# =============================================================================
+
+def collapse_drift_stations(
+    locations: ArrayLike,
+    times_s: ArrayLike,
+    dv: ArrayLike,
+) -> pd.DataFrame:
+    """Collapse repeat readings at each drift station to one mean value.
+
+    Returns a frame with one row per DriftMeasurementLocation, ordered by mean
+    time, containing: location, mean_time_s, mean_dV, n_readings, std_dV.
+    """
+    frame = pd.DataFrame(
+        {
+            "location": pd.Series(locations).astype(str).values,
+            "time_s": np.asarray(times_s, dtype=float),
+            "dV": np.asarray(dv, dtype=float),
+        }
+    )
+    frame = frame.dropna(subset=["dV"])
+
+    grouped = (
+        frame.groupby("location", sort=False)
+        .agg(
+            mean_time_s=("time_s", "mean"),
+            mean_dV=("dV", "mean"),
+            std_dV=("dV", "std"),
+            n_readings=("dV", "size"),
+        )
+        .reset_index()
+    )
+
+    # Order stations chronologically; fall back to file order if times are absent
+    if grouped["mean_time_s"].notna().all():
+        grouped = grouped.sort_values("mean_time_s").reset_index(drop=True)
+
+    return grouped
+
+
+def fit_drift_line(stations: pd.DataFrame) -> tuple[float, float, float, int]:
+    """Fit dV = slope * t + intercept through drift station means.
+
+    `t` is elapsed seconds relative to the first station. Returns
+    (slope_mV_per_s, intercept_mV, r2, n_stations). With too few stations or
+    missing times, returns a zero-slope constant offset.
+    """
+    n_stations = len(stations)
+
+    if n_stations == 0:
+        return 0.0, 0.0, float("nan"), 0
+
+    times = stations["mean_time_s"].to_numpy(dtype=float)
+    values = stations["mean_dV"].to_numpy(dtype=float)
+
+    usable_times = np.isfinite(times).all() and (np.ptp(times) > 0.0)
+
+    if n_stations < DRIFT_MIN_STATIONS_FOR_FIT or not usable_times:
+        return 0.0, float(np.mean(values)), float("nan"), n_stations
+
+    t_rel = times - times[0]
+    coeffs, r2, _ = ls_poly(order=1, x=t_rel, y=values)
+    intercept = float(coeffs[0])
+    slope = float(coeffs[1])
+
+    return slope, intercept, r2, n_stations
+
+
+# =============================================================================
+# MAIN PROCESSING
+# =============================================================================
+
 def process_code(
     plot: bool = False,
     write: bool = False,
@@ -306,12 +459,27 @@ def process_code(
 
     # ---- SP data ----
     sp_df = pd.read_csv(SP_DATA)
+    sp_df.columns = [str(c).strip() for c in sp_df.columns]
 
-    # Expect Rio Grande-style columns: Segment_ID, ..., Longitude, Latitude, Measured_Voltage_millivolts
-    spid = sp_df.iloc[:, 0].values
-    spx = sp_df.iloc[:, 5].values
-    spy = sp_df.iloc[:, 6].values
-    spmv = sp_df.iloc[:, 7].values
+    sp_id_col = resolve_column(
+        sp_df, "Segment_ID", "SegmentID", index_fallback=0, label="SP segment id"
+    )
+    sp_time_col = resolve_column(
+        sp_df, "Measurement_Time", "MeasurementTime", index_fallback=4,
+        label="SP measurement time",
+    )
+    sp_x_col = resolve_column(sp_df, "Longitude", index_fallback=5, label="SP longitude")
+    sp_y_col = resolve_column(sp_df, "Latitude", index_fallback=6, label="SP latitude")
+    sp_v_col = resolve_column(
+        sp_df, "Measured_Voltage_millivolts", "MeasuredVoltagemillivolts",
+        index_fallback=7, label="SP voltage",
+    )
+
+    spid = sp_df[sp_id_col].values
+    spx = pd.to_numeric(sp_df[sp_x_col], errors="coerce").values
+    spy = pd.to_numeric(sp_df[sp_y_col], errors="coerce").values
+    spmv = pd.to_numeric(sp_df[sp_v_col], errors="coerce").values
+    sp_time_s = parse_clock_seconds(sp_df[sp_time_col])
 
     segments: dict[int, dict[str, FloatArray]] = {}
     for uid in np.unique(spid):
@@ -320,13 +488,13 @@ def process_code(
             "SPX": np.asarray(spx[mask], dtype=float),
             "SPY": np.asarray(spy[mask], dtype=float),
             "SPmV": np.asarray(spmv[mask], dtype=float),
+            "TIME_S": np.asarray(sp_time_s[mask], dtype=float),
         }
 
     segment_ids = sorted(segments.keys())
 
     spd: dict[int, FloatArray] = {}
     spd_survey: dict[int, FloatArray] = {}
-    # Distances along each segment, and survey-wide distances relative to first segment
     first_seg = segment_ids[0]
     spx_ref = segments[first_seg]["SPX"]
     spy_ref = segments[first_seg]["SPY"]
@@ -334,11 +502,10 @@ def process_code(
     for seg_id in segment_ids:
         spx_i = segments[seg_id]["SPX"]
         spy_i = segments[seg_id]["SPY"]
-        spd_i = haversine_dist_km(spy_i[0], spx_i[0], spy_i, spx_i, r_earth)
-        spd[seg_id] = spd_i
-
-        spd_survey_i = haversine_dist_km(spy_ref[0], spx_ref[0], spy_i, spx_i, r_earth)
-        spd_survey[seg_id] = spd_survey_i
+        spd[seg_id] = haversine_dist_km(spy_i[0], spx_i[0], spy_i, spx_i, r_earth)
+        spd_survey[seg_id] = haversine_dist_km(
+            spy_ref[0], spx_ref[0], spy_i, spx_i, r_earth
+        )
 
     # NOTE: segment-specific deletions from MATLAB are omitted here to keep
     # workflow general over arbitrary segment IDs.
@@ -346,45 +513,110 @@ def process_code(
     # ---- Drift correction (optional) ----
     has_drift = SP_DRIFT is not None and SP_DRIFT.exists()
 
-    drift_segments: dict[int, dict[str, FloatArray]] = {}
-    drift_corrs = np.empty((0, 4), dtype=float)
+    drift_segments: dict[int, dict[str, Any]] = {}
+    drift_stations: dict[int, pd.DataFrame] = {}
+    drift_corrs = np.empty((0, 5), dtype=float)
     spmv_corr: dict[int, FloatArray] = {}
 
     if has_drift:
         drift_df = pd.read_csv(SP_DRIFT)
-        drift_id = drift_df.iloc[:, 0].values
-        drift_n = drift_df.iloc[:, 2].values
-        drift_dv = drift_df.iloc[:, 4].values
+        drift_df.columns = [str(c).strip() for c in drift_df.columns]
+
+        d_id_col = resolve_column(
+            drift_df, "SegmentID", "Segment_ID", index_fallback=0,
+            label="drift segment id",
+        )
+        d_n_col = resolve_column(
+            drift_df, "MeasurementNumber", "Measurement_Number", index_fallback=1,
+            label="drift measurement number",
+        )
+        d_loc_col = resolve_column(
+            drift_df, "DriftMeasurementLocation", "DRIFT_MEASUREMENT_LOCATION",
+            index_fallback=2, label="drift location",
+        )
+        d_time_col = resolve_column(
+            drift_df, "MeasurementTime", "Measurement_Time", index_fallback=3,
+            label="drift measurement time",
+        )
+        d_v_col = resolve_column(
+            drift_df, "MeasuredVoltagemillivolts", "Measured_Voltage_millivolts",
+            index_fallback=4, label="drift voltage",
+        )
+
+        drift_id = drift_df[d_id_col].values
+        drift_n = pd.to_numeric(drift_df[d_n_col], errors="coerce").values
+        drift_loc = drift_df[d_loc_col].astype(str).values
+        drift_dv = pd.to_numeric(drift_df[d_v_col], errors="coerce").values
+        drift_time_s = parse_clock_seconds(drift_df[d_time_col])
 
         for uid in np.unique(drift_id):
             mask = drift_id == uid
             drift_segments[int(uid)] = {
                 "N": np.asarray(drift_n[mask], dtype=float),
                 "dV": np.asarray(drift_dv[mask], dtype=float),
+                "LOC": drift_loc[mask],
+                "TIME_S": np.asarray(drift_time_s[mask], dtype=float),
             }
 
         drift_corrs_list: list[list[float]] = []
         for seg_id in segment_ids:
             if seg_id not in drift_segments:
                 raise ValueError(f"Missing drift data for segment {seg_id}")
-            dv = drift_segments[seg_id]["dV"]
-            t = np.arange(1, len(dv) + 1, dtype=float)
-            coeffs, r2, _ = ls_poly(order=1, x=t, y=dv)
-            drift_corrs_list.append([float(seg_id), float(coeffs[1]), float(coeffs[0]), r2])
+
+            block = drift_segments[seg_id]
+            stations = collapse_drift_stations(
+                block["LOC"], block["TIME_S"], block["dV"]
+            )
+            drift_stations[seg_id] = stations
+
+            slope, intercept, r2, n_stations = fit_drift_line(stations)
+            drift_corrs_list.append(
+                [float(seg_id), slope, intercept, r2, float(n_stations)]
+            )
+
         drift_corrs = np.array(drift_corrs_list, dtype=float)
 
+        # Apply the drift line at each SP sample's OWN elapsed time, using the
+        # same t0 (first drift station) that anchored the fit.
         for idx, seg_id in enumerate(segment_ids):
             sp = segments[seg_id]["SPmV"]
-            x = np.arange(1, len(sp) + 1, dtype=float)
-            m = drift_corrs[idx, 1]
-            b = drift_corrs[idx, 2]
-            trend = lin(float(m), x, float(b))
+            sp_t = segments[seg_id]["TIME_S"]
+            stations = drift_stations[seg_id]
+
+            slope = drift_corrs[idx, 1]
+            intercept = drift_corrs[idx, 2]
+
+            station_times = stations["mean_time_s"].to_numpy(dtype=float)
+            have_station_t0 = len(station_times) > 0 and np.isfinite(station_times[0])
+
+            if slope != 0.0 and have_station_t0 and np.isfinite(sp_t).all():
+                t_rel = sp_t - station_times[0]
+            elif slope != 0.0:
+                # Times unusable on the SP side: degrade to normalized position
+                # across the station time span so the correction stays bounded.
+                span = float(np.nanmax(station_times) - np.nanmin(station_times))
+                t_rel = np.linspace(0.0, span, len(sp))
+                print(
+                    f"WARNING: segment {seg_id} SP timestamps unusable; "
+                    f"drift applied over a linear {span:.0f} s ramp instead."
+                )
+            else:
+                t_rel = np.zeros(len(sp), dtype=float)
+
+            trend = lin(float(slope), t_rel, float(intercept))
             spmv_corr[seg_id] = sp - trend
+
+            print(
+                f"Segment {seg_id}: drift slope {slope:+.6f} mV/s "
+                f"({slope * 3600.0:+.3f} mV/hr), intercept {intercept:+.3f} mV, "
+                f"r2 {drift_corrs[idx, 3]:.3f}, "
+                f"{int(drift_corrs[idx, 4])} station(s)"
+            )
     else:
-        drift_corrs = np.empty((0, 4), dtype=float)
+        drift_corrs = np.empty((0, 5), dtype=float)
         spmv_corr = {seg_id: segments[seg_id]["SPmV"].copy() for seg_id in segment_ids}
 
-    # Simple inter-segment shifting analogous to original code, but only if we have multiple segments
+    # Simple inter-segment shifting analogous to original code
     if len(segment_ids) >= 1:
         first = segment_ids[0]
         spmv_corr[first] = spmv_corr[first] - spmv_corr[first][0]
@@ -413,8 +645,8 @@ def process_code(
         pair2 = []
         spmv34c = np.array([], dtype=float)
 
-    # Drift FFT spectra only if drift exists
-    if has_drift:
+    # Drift FFT spectra only if drift exists and every segment has enough samples
+    if has_drift and all(len(drift_segments[s]["dV"]) >= 2 for s in segment_ids):
         _amps, _freqs = pspec(
             [1] * len(segment_ids),
             *[drift_segments[s]["dV"] for s in segment_ids],
@@ -478,6 +710,7 @@ def process_code(
         vn34 = -vn34
     else:
         dvl34 = np.array([], dtype=float)
+        dvhn34 = np.array([], dtype=float)
         dvh34 = np.array([], dtype=float)
         dvn34 = np.array([], dtype=float)
         v34 = np.array([], dtype=float)
@@ -498,11 +731,27 @@ def process_code(
 
     if has_tc:
         tc_df = pd.read_csv(TC_DATA)
-        stid = tc_df.iloc[:, 0].values
-        stx = tc_df.iloc[:, 5].values
-        sty = tc_df.iloc[:, 6].values
-        temp = tc_df.iloc[:, 7].values
-        cond = tc_df.iloc[:, 8].values
+        tc_df.columns = [str(c).strip() for c in tc_df.columns]
+
+        tc_id_col = resolve_column(
+            tc_df, "SegmentID", "Segment_ID", index_fallback=0, label="TC segment id"
+        )
+        tc_x_col = resolve_column(tc_df, "Longitude", index_fallback=5, label="TC longitude")
+        tc_y_col = resolve_column(tc_df, "Latitude", index_fallback=6, label="TC latitude")
+        tc_t_col = resolve_column(
+            tc_df, "MeasuredSurfaceWaterTemperatureCelsius", index_fallback=7,
+            label="TC temperature",
+        )
+        tc_c_col = resolve_column(
+            tc_df, "MeasuredSurfaceWaterConductivitymicrosiemenspercm",
+            index_fallback=8, label="TC conductivity",
+        )
+
+        stid = tc_df[tc_id_col].values
+        stx = pd.to_numeric(tc_df[tc_x_col], errors="coerce").values
+        sty = pd.to_numeric(tc_df[tc_y_col], errors="coerce").values
+        temp = pd.to_numeric(tc_df[tc_t_col], errors="coerce").values
+        cond = pd.to_numeric(tc_df[tc_c_col], errors="coerce").values
 
         first_stid = int(np.unique(stid)[0])
         stx1 = np.asarray(stx[stid == first_stid], dtype=float)
@@ -612,10 +861,9 @@ def process_code(
             PROCESSED_DIR / "Gradient_Self_Potential_python.csv", index=False
         )
 
-        # Electric potential output (only for concatenated series we actually have)
+        # Electric potential output
         interp_blocks: list[FloatArray] = []
 
-        # First concatenated series
         spx12 = np.concatenate([segments[s]["SPX"] for s in pair1])
         spy12 = np.concatenate([segments[s]["SPY"] for s in pair1])
         seg_ids_12 = np.concatenate(
@@ -639,7 +887,6 @@ def process_code(
         )
         interp_blocks.append(interp12)
 
-        # Second concatenated series, if present
         if len(spmv34c) > 0 and len(pair2) > 0:
             spx34 = np.concatenate([segments[s]["SPX"] for s in pair2])
             spy34 = np.concatenate([segments[s]["SPY"] for s in pair2])
@@ -728,8 +975,35 @@ def process_code(
         # Drift correction summary (only if drift was present)
         if has_drift and drift_corrs.size > 0:
             pd.DataFrame(
-                drift_corrs, columns=["segment_id", "slope_m", "intercept_b", "r2"]
+                drift_corrs,
+                columns=[
+                    "segment_id",
+                    "slope_mV_per_s",
+                    "intercept_mV",
+                    "r2",
+                    "n_stations",
+                ],
             ).to_csv(PROCESSED_DIR / "Drift_Correction_python.csv", index=False)
+
+            # Per-station drift means - useful QA for electrode stability
+            station_frames: list[pd.DataFrame] = []
+            for seg_id, stations in drift_stations.items():
+                block = stations.copy()
+                block.insert(0, "segment_id", seg_id)
+                if len(block) > 0 and np.isfinite(
+                    block["mean_time_s"].to_numpy(dtype=float)
+                ).all():
+                    block["elapsed_s"] = (
+                        block["mean_time_s"] - block["mean_time_s"].iloc[0]
+                    )
+                else:
+                    block["elapsed_s"] = np.nan
+                station_frames.append(block)
+
+            if station_frames:
+                pd.concat(station_frames, ignore_index=True).to_csv(
+                    PROCESSED_DIR / "Drift_Stations_python.csv", index=False
+                )
 
         if has_tc and temp_corrs.size > 0:
             pd.DataFrame(
