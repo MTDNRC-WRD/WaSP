@@ -1,11 +1,11 @@
 [paths]
-input_dir = 'C:\Users\CND367\Documents\WaSP\test2'
-processed_dir = 'C:\Users\CND367\Documents\WaSP\test2\processed'
-figures_dir = 'C:\Users\CND367\Documents\WaSP\test2\figures'
+input_dir = 'C:\Users\CND367\Documents\WaSP\test2_nd'
+processed_dir = 'C:\Users\CND367\Documents\WaSP\test2_nd\processed'
+figures_dir = 'C:\Users\CND367\Documents\WaSP\test2_nd\figures'
 
 [files]
 sp_data = 'formatted_self_potential.csv'
-drift_data = 'drift_self_potential.csv'
+drift_data = ''
 temp_cond_data = 'formatted_conductivity.csv'
 hfem_resistivity = ''
 

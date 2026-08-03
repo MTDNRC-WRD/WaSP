@@ -6,6 +6,29 @@ electric potential, temperature, and conductivity. Missing CSV inputs are
 treated as optional: the script prints a terminal warning and skips any plots
 that depend on unavailable files.
 
+Outlier handling
+----------------
+Real surveys contain electrode dropouts and contact spikes that are orders of
+magnitude larger than the signal of interest. Left alone, Matplotlib's
+autoscaling stretches the y-axis to contain them and flattens everything else.
+
+Two exclusion tables at the top of this module control which samples are
+allowed to influence the y-axis limits:
+
+* `EXCLUDE_X_RANGES` - windows along the x-axis (segment distance in km, or
+  sample index, depending on the plot) whose samples are ignored when the
+  limits are computed.
+* `EXCLUDE_Y_RANGES` - value windows; any y value falling inside one of them is
+  ignored. Use `float("-inf")` or `float("inf")` for one-sided cuts.
+
+Excluded samples are still plotted. Matplotlib simply clips them at the axis
+edge, so nothing is silently deleted from the figure. Excluded x windows are
+shaded so the exclusion stays visible when the figure is reviewed later.
+
+When a figure needs a fixed frame instead - for a report, or to compare two
+surveys on identical axes - `MANUAL_Y_LIMITS` and `MANUAL_X_LIMITS` set hard
+bounds per axis and bypass the automatic calculation entirely.
+
 The main entry point is `main()`, which parses a config path from the command
 line and writes the figures into the configured figures directory.
 """
@@ -13,16 +36,246 @@ line and writes the figures into the configured figures directory.
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 from typing import Any
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import tomllib
+from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 
 ConfigDict = dict[str, Any]
+Range = tuple[float, float]
 
+
+# =============================================================================
+# AUTOSCALE SETTINGS
+# =============================================================================
+
+# X-axis windows to ignore when computing y-limits, keyed by axis.
+#
+# Units follow whatever that axis plots:
+#   sp_segments                -> segment distance, km
+#   interpretation_upstream    -> sample index
+#   interpretation_downstream  -> sample index
+#   integrated_*               -> sample index
+#   temperature, conductivity  -> segment distance, km
+#
+# Example - drop a bad electrode stretch and a launch transient:
+#   "sp_segments": [(0.00, 0.02), (0.61, 0.68)],
+EXCLUDE_X_RANGES: dict[str, list[Range]] = {
+    "sp_segments": [],
+    "interpretation_upstream": [],
+    "interpretation_downstream": [],
+    "integrated_V_full": [],
+    "integrated_VL_lowfreq": [],
+    "integrated_VH_highfreq": [],
+    "integrated_VN_noise": [],
+    "temperature": [],
+    "conductivity": [],
+}
+
+# Value windows to ignore when computing y-limits, keyed by the same axis names.
+#
+# Example - ignore anything beyond +/- 500 mV:
+#   "sp_segments": [(-float("inf"), -500.0), (500.0, float("inf"))],
+EXCLUDE_Y_RANGES: dict[str, list[Range]] = {
+    "sp_segments": [],
+    "interpretation_upstream": [],
+    "interpretation_downstream": [],
+    "integrated_V_full": [],
+    "integrated_VL_lowfreq": [],
+    "integrated_VH_highfreq": [],
+    "integrated_VN_noise": [],
+    "temperature": [],
+    "conductivity": [],
+}
+
+# Hard y-limits, keyed by the same axis names. An entry that is not None wins
+# outright: the exclusion tables and percentile clipping are skipped for that
+# axis. Either bound may be None to pin one end and autoscale the other.
+#
+# Examples:
+#   "sp_segments": (-40.0, 60.0),     both ends fixed
+#   "temperature": (None, 3.0),       cap the top, autoscale the bottom
+MANUAL_Y_LIMITS: dict[str, tuple[float | None, float | None] | None] = {
+    "sp_segments": (-4, 8),
+    "interpretation_upstream": (-4, 8),
+    "interpretation_downstream": None,
+    "integrated_V_full": None,
+    "integrated_VL_lowfreq": None,
+    "integrated_VH_highfreq": None,
+    "integrated_VN_noise": None,
+    "temperature": None,
+    "conductivity": None,
+}
+
+# Hard x-limits, same convention. Useful for zooming into a reach without
+# touching the processed tables. Note that this only changes the view; it does
+# not remove off-screen samples from the y-limit calculation, so pair it with
+# EXCLUDE_X_RANGES if you want the y-axis to follow the zoom.
+MANUAL_X_LIMITS: dict[str, tuple[float | None, float | None] | None] = {
+    "sp_segments": None,
+    "interpretation_upstream": None,
+    "interpretation_downstream": None,
+    "integrated_V_full": None,
+    "integrated_VL_lowfreq": None,
+    "integrated_VH_highfreq": None,
+    "integrated_VN_noise": None,
+    "temperature": None,
+    "conductivity": None,
+}
+
+# Headroom added above and below the surviving data range.
+Y_PAD_FRAC = 0.05
+
+# Optional automatic outlier rejection applied after the explicit exclusions.
+# Set to a (low, high) percentile pair such as (1.0, 99.0) to clip without
+# hand-listing ranges, or None to use the full surviving min/max.
+AUTOSCALE_PERCENTILES: tuple[float, float] | None = None
+
+# Shade excluded x windows so the exclusion is visible in the saved figure.
+SHADE_EXCLUDED_X = True
+
+
+# =============================================================================
+# AUTOSCALE HELPER
+# =============================================================================
+
+class AxisScaler:
+    """Accumulate plotted series and set y-limits from non-excluded samples.
+
+    Feed every series drawn on an axis through `add()`, then call `apply()`
+    once after all plotting on that axis is finished.
+
+    Attributes:
+        key: Axis name used to look up entries in the exclusion tables.
+    """
+
+    def __init__(self, key: str) -> None:
+        """Initialise a scaler for one axis.
+
+        Args:
+            key: Axis name; must match a key in the exclusion tables to have
+                any effect. Unknown keys simply apply no exclusions.
+        """
+        self.key = key
+        self.x_excl: list[Range] = list(EXCLUDE_X_RANGES.get(key, ()))
+        self.y_excl: list[Range] = list(EXCLUDE_Y_RANGES.get(key, ()))
+        self.y_manual = MANUAL_Y_LIMITS.get(key)
+        self.x_manual = MANUAL_X_LIMITS.get(key)
+        self._kept: list[np.ndarray] = []
+        self._n_finite = 0
+        self._n_dropped = 0
+
+    def add(self, x: Any, y: Any) -> None:
+        """Register one plotted series with the scaler.
+
+        Args:
+            x: X values of the series, in that axis's own units.
+            y: Y values of the series.
+
+        Raises:
+            ValueError: If `x` and `y` have different lengths.
+        """
+        xv = np.asarray(x, dtype=float)
+        yv = np.asarray(y, dtype=float)
+        if xv.size != yv.size:
+            raise ValueError(
+                f"AxisScaler[{self.key}]: x has {xv.size} points, y has {yv.size}"
+            )
+
+        keep = np.isfinite(yv)
+        n_finite = int(keep.sum())
+
+        for lo, hi in self.x_excl:
+            keep &= ~((xv >= lo) & (xv <= hi))
+        for lo, hi in self.y_excl:
+            keep &= ~((yv >= lo) & (yv <= hi))
+
+        self._n_finite += n_finite
+        self._n_dropped += n_finite - int(keep.sum())
+        if keep.any():
+            self._kept.append(yv[keep])
+
+    def apply(self, ax: Axes) -> None:
+        """Shade excluded windows and set the limits on `ax`.
+
+        Manual limits take priority. When only one manual y bound is given,
+        the other end is autoscaled from the surviving samples first.
+
+        Args:
+            ax: Axis to rescale. If every sample was excluded, or no series
+                were registered, Matplotlib's own autoscaling is left in place.
+        """
+        if self.x_excl and SHADE_EXCLUDED_X:
+            xlim = ax.get_xlim()
+            for lo, hi in self.x_excl:
+                ax.axvspan(lo, hi, color="0.80", alpha=0.45, lw=0, zorder=0)
+            ax.set_xlim(xlim)
+
+        if self.x_manual is not None:
+            x_lo, x_hi = self.x_manual
+            ax.set_xlim(left=x_lo, right=x_hi)
+            print(f"[INFO] '{self.key}': manual x-limits {x_lo} to {x_hi}")
+
+        if self.y_manual is not None:
+            y_lo, y_hi = self.y_manual
+            if y_lo is None or y_hi is None:
+                # Autoscale the open end from the surviving samples first, so
+                # the pinned end does not drag the free end along with it.
+                self._autoscale_y(ax)
+            ax.set_ylim(bottom=y_lo, top=y_hi)
+            print(f"[INFO] '{self.key}': manual y-limits {y_lo} to {y_hi}")
+            return
+
+        self._autoscale_y(ax)
+
+    def _autoscale_y(self, ax: Axes) -> None:
+        """Set y-limits from the samples that survived the exclusion tables.
+
+        Args:
+            ax: Axis to rescale.
+        """
+        if not self._kept:
+            if self.x_excl or self.y_excl:
+                print(
+                    f"[WARN] '{self.key}': exclusions removed every sample; "
+                    "leaving automatic scaling in place."
+                )
+            return
+
+        vals = np.concatenate(self._kept)
+
+        if AUTOSCALE_PERCENTILES is not None:
+            lo_p, hi_p = AUTOSCALE_PERCENTILES
+            lo, hi = (float(v) for v in np.percentile(vals, [lo_p, hi_p]))
+        else:
+            lo, hi = float(vals.min()), float(vals.max())
+
+        if not (math.isfinite(lo) and math.isfinite(hi)):
+            return
+
+        span = hi - lo
+        if span <= 0.0:
+            span = max(abs(hi), 1.0) * 0.1
+        pad = span * Y_PAD_FRAC
+        ax.set_ylim(lo - pad, hi + pad)
+
+        if self._n_dropped:
+            print(
+                f"[INFO] '{self.key}': {self._n_dropped} of {self._n_finite} "
+                f"samples excluded from y-scaling; "
+                f"limits {lo - pad:.4g} to {hi + pad:.4g}"
+            )
+
+
+# =============================================================================
+# IO
+# =============================================================================
 
 def load_config(config_path: str | Path = "config.toml") -> ConfigDict:
     """Load TOML configuration from disk.
@@ -85,12 +338,19 @@ def savefig(fig: Figure, path: Path) -> None:
     plt.close(fig)
 
 
+# =============================================================================
+# FIGURES
+# =============================================================================
+
 def plot_gradient_sp_segments(df: pd.DataFrame, figures_dir: Path) -> None:
     """Plot drift-corrected gradient self-potential by segment.
 
     Args:
         df: DataFrame containing the processed gradient SP table.
         figures_dir: Output directory for figure files.
+
+    Notes:
+        Y-limits honour the `sp_segments` entries in the exclusion tables.
     """
     fig, ax = plt.subplots(figsize=(12, 5))
     colors: dict[int, str] = {1: "k", 2: "b", 3: "c", 4: "m"}
@@ -101,6 +361,8 @@ def plot_gradient_sp_segments(df: pd.DataFrame, figures_dir: Path) -> None:
         4: "Segment 4",
     }
 
+    scaler = AxisScaler("sp_segments")
+
     for seg in sorted(df["segment_id"].unique()):
         d = df[df["segment_id"] == seg].copy()
         ax.plot(
@@ -110,6 +372,7 @@ def plot_gradient_sp_segments(df: pd.DataFrame, figures_dir: Path) -> None:
             lw=1.2,
             label=labels.get(int(seg), f"Segment {seg}"),
         )
+        scaler.add(d["segment_distance_km"], d["drift_corrected_SP_mV"])
 
     ax.set_xlabel("Segment Distance (km)")
     ax.set_ylabel("Voltage (mV)")
@@ -117,6 +380,7 @@ def plot_gradient_sp_segments(df: pd.DataFrame, figures_dir: Path) -> None:
     ax.legend()
     ax.minorticks_on()
     ax.grid(alpha=0.2)
+    scaler.apply(ax)
 
     savefig(fig, figures_dir / "figure_sp_segments.png")
 
@@ -131,74 +395,57 @@ def plot_interpretation_segments(df: pd.DataFrame, figures_dir: Path) -> None:
     Notes:
         This function expects segment groups 1-2 and 3-4. If one group is not
         present, the corresponding subplot is annotated instead of failing.
+
+        Y-limits honour the `interpretation_upstream` and
+        `interpretation_downstream` exclusion entries. The x-axis is sample
+        index, so x exclusions are given in samples.
     """
     fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=False)
 
-    upstream = df[df["segment_id"].isin([1, 2])].copy()
-    downstream = df[df["segment_id"].isin([3, 4])].copy()
-
-    if not upstream.empty:
-        axes[0].plot(
-            range(len(upstream)),
-            upstream["SPmV_drift_corrected"],
-            "k",
-            lw=1.0,
-            label="Full Signal",
-        )
-        axes[0].plot(
-            range(len(upstream)),
-            upstream["DVL_lowfreq"],
-            "r",
-            lw=1.0,
-            label="Low Frequency",
-        )
-        axes[0].legend()
-    else:
-        axes[0].text(
-            0.5,
-            0.5,
+    groups: list[tuple[Axes, pd.DataFrame, str, str, str]] = [
+        (
+            axes[0],
+            df[df["segment_id"].isin([1, 2])].copy(),
+            "interpretation_upstream",
+            "Interpretation Segment 1-2",
             "No Segment 1-2 data found",
-            ha="center",
-            va="center",
-            transform=axes[0].transAxes,
-        )
-
-    axes[0].set_title("Interpretation Segment 1-2")
-    axes[0].set_ylabel("Voltage (mV)")
-    axes[0].minorticks_on()
-    axes[0].grid(alpha=0.2)
-
-    if not downstream.empty:
-        axes[1].plot(
-            range(len(downstream)),
-            downstream["SPmV_drift_corrected"],
-            "k",
-            lw=1.0,
-            label="Full Signal",
-        )
-        axes[1].plot(
-            range(len(downstream)),
-            downstream["DVL_lowfreq"],
-            "r",
-            lw=1.0,
-            label="Low Frequency",
-        )
-        axes[1].legend()
-    else:
-        axes[1].text(
-            0.5,
-            0.5,
+        ),
+        (
+            axes[1],
+            df[df["segment_id"].isin([3, 4])].copy(),
+            "interpretation_downstream",
+            "Interpretation Segment 3-4",
             "No Segment 3-4 data found",
-            ha="center",
-            va="center",
-            transform=axes[1].transAxes,
-        )
+        ),
+    ]
 
-    axes[1].set_title("Interpretation Segment 3-4")
+    for ax, d, key, title, empty_msg in groups:
+        scaler = AxisScaler(key)
+
+        if not d.empty:
+            idx = np.arange(len(d))
+            ax.plot(idx, d["SPmV_drift_corrected"], "k", lw=1.0, label="Full Signal")
+            ax.plot(idx, d["DVL_lowfreq"], "r", lw=1.0, label="Low Frequency")
+            scaler.add(idx, d["SPmV_drift_corrected"])
+            scaler.add(idx, d["DVL_lowfreq"])
+            ax.legend()
+        else:
+            ax.text(
+                0.5,
+                0.5,
+                empty_msg,
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
+
+        ax.set_title(title)
+        ax.set_ylabel("Voltage (mV)")
+        ax.minorticks_on()
+        ax.grid(alpha=0.2)
+        scaler.apply(ax)
+
     axes[1].set_xlabel("Sample Index")
-    axes[1].set_ylabel("Voltage (mV)")
-    axes[1].minorticks_on()
-    axes[1].grid(alpha=0.2)
 
     savefig(fig, figures_dir / "figure_interpretation_segments.png")
 
@@ -214,6 +461,9 @@ def plot_integrated_potential(df: pd.DataFrame, figures_dir: Path) -> None:
         This function expects segment groups 1-2 and 3-4. If one or both
         groups are missing, the available data are plotted and empty panels are
         annotated.
+
+        Each panel scales independently using its own `integrated_<column>`
+        exclusion entry. The x-axis is sample index.
     """
     fig, axes = plt.subplots(2, 2, figsize=(12, 8), sharex=False)
 
@@ -228,22 +478,17 @@ def plot_integrated_potential(df: pd.DataFrame, figures_dir: Path) -> None:
     ]
 
     for ax, (col, title) in zip(axes.flat, series):
+        scaler = AxisScaler(f"integrated_{col}")
+
         if not upstream.empty:
-            ax.plot(
-                range(len(upstream)),
-                upstream[col],
-                "k",
-                lw=1.0,
-                label="Segment 1-2",
-            )
+            idx = np.arange(len(upstream))
+            ax.plot(idx, upstream[col], "k", lw=1.0, label="Segment 1-2")
+            scaler.add(idx, upstream[col])
         if not downstream.empty:
-            ax.plot(
-                range(len(downstream)),
-                downstream[col],
-                color="0.35",
-                lw=1.0,
-                label="Segment 3-4",
-            )
+            idx = np.arange(len(downstream))
+            ax.plot(idx, downstream[col], color="0.35", lw=1.0, label="Segment 3-4")
+            scaler.add(idx, downstream[col])
+
         if upstream.empty and downstream.empty:
             ax.text(
                 0.5,
@@ -261,6 +506,7 @@ def plot_integrated_potential(df: pd.DataFrame, figures_dir: Path) -> None:
         ax.set_ylabel("Voltage (mV)")
         ax.minorticks_on()
         ax.grid(alpha=0.2)
+        scaler.apply(ax)
 
     savefig(fig, figures_dir / "figure_integrated_potential.png")
 
@@ -271,28 +517,40 @@ def plot_temp_cond(df: pd.DataFrame, figures_dir: Path) -> None:
     Args:
         df: DataFrame containing the processed temperature/conductivity table.
         figures_dir: Output directory for figure files.
+
+    Notes:
+        Y-limits honour the `temperature` and `conductivity` exclusion entries.
+        X exclusions are given in kilometres of segment distance.
     """
     fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=False)
     colors: dict[int, str] = {1: "k", 2: "r", 3: "g", 4: "b"}
 
+    temp_scaler = AxisScaler("temperature")
+    cond_scaler = AxisScaler("conductivity")
+
     for seg in sorted(df["segment_id"].unique()):
         d = df[df["segment_id"] == seg].copy()
+        dist_km = d["segment_distance_m"] / 1000.0
+        d_temp = d["temp_degC"] - d["temp_degC"].iloc[0]
+        d_cond = d["cond_uS_cm"] - d["cond_uS_cm"].iloc[0]
 
         axes[0].plot(
-            d["segment_distance_m"] / 1000.0,
-            d["temp_degC"] - d["temp_degC"].iloc[0],
+            dist_km,
+            d_temp,
             color=colors.get(int(seg), None),
             lw=1.2,
             label=f"Segment {seg}",
         )
+        temp_scaler.add(dist_km, d_temp)
 
         axes[1].plot(
-            d["segment_distance_m"] / 1000.0,
-            d["cond_uS_cm"] - d["cond_uS_cm"].iloc[0],
+            dist_km,
+            d_cond,
             color=colors.get(int(seg), None),
             lw=1.2,
             label=f"Segment {seg}",
         )
+        cond_scaler.add(dist_km, d_cond)
 
     axes[0].set_title("Raw Temperature Change Relative to Segment Start")
     axes[0].set_xlabel("Segment Distance (km)")
@@ -300,6 +558,7 @@ def plot_temp_cond(df: pd.DataFrame, figures_dir: Path) -> None:
     axes[0].legend()
     axes[0].minorticks_on()
     axes[0].grid(alpha=0.2)
+    temp_scaler.apply(axes[0])
 
     axes[1].set_title("Raw Conductivity Change Relative to Segment Start")
     axes[1].set_xlabel("Segment Distance (km)")
@@ -307,9 +566,14 @@ def plot_temp_cond(df: pd.DataFrame, figures_dir: Path) -> None:
     axes[1].legend()
     axes[1].minorticks_on()
     axes[1].grid(alpha=0.2)
+    cond_scaler.apply(axes[1])
 
     savefig(fig, figures_dir / "figure_temp_cond.png")
 
+
+# =============================================================================
+# DRIVER
+# =============================================================================
 
 def run_all_plots(config_path: str | Path = "config.toml") -> None:
     """Generate all available standard figures from processed output tables.
@@ -355,7 +619,10 @@ def run_all_plots(config_path: str | Path = "config.toml") -> None:
     if wrote_any:
         print(f"[INFO] Wrote available figures to {figures_dir}")
     else:
-        print(f"[WARN] No input CSV files found in {processed_dir}; no figures were created.")
+        print(
+            f"[WARN] No input CSV files found in {processed_dir}; "
+            "no figures were created."
+        )
 
 
 def main() -> None:
