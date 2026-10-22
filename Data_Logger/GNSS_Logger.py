@@ -12,18 +12,20 @@ Features:
 - Avoids overwriting an existing CSV by adding a suffix like _01, _02, ...
 - Writes a failure notice and traceback log if the script crashes
 - Plays a Windows notification sound on crash
+- Prompts for a COM port at startup (default COM11), with retry on failure
 - Interactive keyboard controls:
-    - A/a: set mode to "anomaly"
-    - E/e: set mode to "eddy"
-    - D/d: set mode to "drift"
+    - A/a: set mode to "anomaly" (also resumes if paused)
+    - E/e: set mode to "eddy" (also resumes if paused)
+    - D/d: set mode to "drift" (also resumes if paused)
     - P/p: pause logging
-    - R/r: resume logging
-    - S/s: stop logging
+    - R/r: resume logging with the last-used tag
+    - S/s: stop logging and exit the script
 
 The current mode is written to a new CSV column "mode_flag" for each row.
 """
 
 import csv
+import sys
 import time
 import traceback
 from datetime import datetime, timezone
@@ -35,7 +37,7 @@ import winsound
 import msvcrt  # Windows-only keyboard input [web:44]
 
 
-PORT = "COM5"
+DEFAULT_PORT_NUM = 11
 BAUD = 9600
 OUT_CSV = "arrow_log"
 LOG_INTERVAL_SEC = 1.0
@@ -53,6 +55,9 @@ MODE_DRIFT = "drift"
 STATE_RUNNING = "running"
 STATE_PAUSED = "paused"
 STATE_STOPPED = "stopped"
+
+# Global PORT is resolved at startup and used in failure notices
+PORT = None
 
 
 def dm_to_decimal(value, direction):
@@ -136,6 +141,51 @@ def write_failure_notice(error_text):
         log_file.write(notice)
 
 
+def prompt_com_port(default_num=DEFAULT_PORT_NUM):
+    """Ask the user for a COM port number, defaulting if blank.
+
+    Returns a string like "COM11".
+    """
+    raw = input(
+        f"Enter COM port number [default {default_num}]: "
+    ).strip()
+
+    if raw == "":
+        port_num = default_num
+    else:
+        # Allow either "9" or "COM9" style input
+        raw_upper = raw.upper()
+        if raw_upper.startswith("COM"):
+            raw_upper = raw_upper[3:]
+        try:
+            port_num = int(raw_upper)
+        except ValueError:
+            print(f"[WARN] Could not parse '{raw}' as a port number, using default {default_num}.")
+            port_num = default_num
+
+    return f"COM{port_num}"
+
+
+def open_serial_with_retry(baud, timeout_sec):
+    """Prompt for a COM port, try to open it, and retry on failure.
+
+    Returns an open serial.Serial instance and sets the global PORT.
+    """
+    global PORT
+
+    port_name = prompt_com_port(DEFAULT_PORT_NUM)
+
+    while True:
+        try:
+            connection = serial.Serial(port_name, baud, timeout=timeout_sec)
+            PORT = port_name
+            print(f"[STATUS] Connected on {port_name}.")
+            return connection
+        except serial.SerialException as exc:
+            print(f"[ERROR] Could not open {port_name}: {exc}")
+            port_name = prompt_com_port(DEFAULT_PORT_NUM)
+
+
 def print_instructions(output_csv_path):
     """Print startup instructions and status to the terminal."""
     print("=" * 80)
@@ -146,11 +196,11 @@ def print_instructions(output_csv_path):
     print(f"Interval   : {LOG_INTERVAL_SEC} sec")
     print("-" * 80)
     print("Keyboard controls (case-insensitive):")
-    print("  A : set mode to 'anomaly'")
-    print("  E : set mode to 'eddy'")
-    print("  D : set mode to 'drift'")
+    print("  A : set mode to 'anomaly' (resumes if paused)")
+    print("  E : set mode to 'eddy' (resumes if paused)")
+    print("  D : set mode to 'drift' (resumes if paused)")
     print("  P : pause logging (no new rows written)")
-    print("  R : resume logging")
+    print("  R : resume logging with the last-used tag")
     print("  S : stop logging and exit")
     print("-" * 80)
     print("Press Ctrl+C for emergency stop.")
@@ -162,12 +212,12 @@ def poll_keyboard(current_mode, recording_state):
 
     Returns updated (current_mode, recording_state).
     Keys (case-insensitive):
-      A: anomaly mode
-      E: eddy mode
-      D: drift mode
+      A: anomaly mode (resumes if paused)
+      E: eddy mode (resumes if paused)
+      D: drift mode (resumes if paused)
       P: pause logging
-      R: resume logging
-      S: stop logging
+      R: resume logging with last-used tag
+      S: stop logging and exit
     """
     # Non-blocking keyboard check on Windows [web:44][web:51]
     while msvcrt.kbhit():
@@ -178,25 +228,38 @@ def poll_keyboard(current_mode, recording_state):
             continue
 
         key = key.upper()
+        was_paused = recording_state == STATE_PAUSED
 
         if key == "A":
             current_mode = MODE_ANOMALY
-            print("[STATUS] Mode set to ANOMALY.")
+            recording_state = STATE_RUNNING
+            if was_paused:
+                print("[STATUS] Resumed. Mode set to ANOMALY.")
+            else:
+                print("[STATUS] Mode set to ANOMALY.")
         elif key == "E":
             current_mode = MODE_EDDY
-            print("[STATUS] Mode set to EDDY.")
+            recording_state = STATE_RUNNING
+            if was_paused:
+                print("[STATUS] Resumed. Mode set to EDDY.")
+            else:
+                print("[STATUS] Mode set to EDDY.")
         elif key == "D":
             current_mode = MODE_DRIFT
-            print("[STATUS] Mode set to DRIFT.")
+            recording_state = STATE_RUNNING
+            if was_paused:
+                print("[STATUS] Resumed. Mode set to DRIFT.")
+            else:
+                print("[STATUS] Mode set to DRIFT.")
         elif key == "P":
             recording_state = STATE_PAUSED
             print("[STATUS] Recording PAUSED.")
         elif key == "R":
             recording_state = STATE_RUNNING
-            print("[STATUS] Recording RESUMED.")
+            print(f"[STATUS] Recording RESUMED with mode={current_mode or 'none'}.")
         elif key == "S":
             recording_state = STATE_STOPPED
-            print("[STATUS] Recording STOPPED (will exit after current loop).")
+            print("[STATUS] Recording STOPPED. Exiting.")
 
     return current_mode, recording_state
 
@@ -219,10 +282,13 @@ def main():
     connection_lost = False
     current_mode = MODE_NONE
     recording_state = STATE_RUNNING
+    was_paused_last_loop = False
 
     output_csv_path = resolve_output_csv_path(OUT_CSV)
 
-    with serial.Serial(PORT, BAUD, timeout=SERIAL_TIMEOUT_SEC) as serial_connection, open(
+    serial_connection = open_serial_with_retry(BAUD, SERIAL_TIMEOUT_SEC)
+
+    with serial_connection, open(
         output_csv_path, "w", newline="", encoding="utf-8"
     ) as output_file:
         writer = csv.writer(output_file)
@@ -248,12 +314,19 @@ def main():
         print_instructions(output_csv_path)
 
         while True:
-            # Check keyboard first so pause/stop applies quickly
+            # Check keyboard first so pause/resume/stop applies quickly
             current_mode, recording_state = poll_keyboard(current_mode, recording_state)
 
             if recording_state == STATE_STOPPED:
                 print("[STATUS] Exiting logging loop due to STOP command.")
                 break
+
+            if recording_state == STATE_PAUSED:
+                if not was_paused_last_loop:
+                    print("[STATUS] Recording paused.")
+                was_paused_last_loop = True
+            else:
+                was_paused_last_loop = False
 
             raw_bytes = serial_connection.readline()
 
@@ -291,10 +364,9 @@ def main():
                 if current_time - last_log_time < LOG_INTERVAL_SEC:
                     continue
 
-                # If paused, skip writing but keep timing cadence
+                # If paused, skip writing but keep timing cadence (no per-row print)
                 if recording_state != STATE_RUNNING:
                     last_log_time = current_time
-                    print(f"[STATUS] Paused at {local_now_iso()} | mode={current_mode or 'none'}")
                     continue
 
                 latitude_dd = dm_to_decimal(message.lat, message.lat_dir)
@@ -341,6 +413,9 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("\n[STATUS] Logging stopped by user (Ctrl+C).")
+        sys.exit(0)
+    except SystemExit:
+        raise
     except Exception:
         error_text = traceback.format_exc()
         write_failure_notice(error_text)

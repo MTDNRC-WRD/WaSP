@@ -97,6 +97,9 @@ GAUSS_SIGMA = int(CFG["processing"]["gaussian_sigma"])
 BOXCAR_M = int(CFG["processing"]["boxcar_m"])
 BOXCAR_ITS = int(CFG["processing"]["boxcar_iterations"])
 
+ZERO_FIRST_SEGMENT = bool(CFG["processing"].get("zero_first_segment", True))
+TIE_SEGMENTS = bool(CFG["processing"].get("tie_segments", True))
+
 # Minimum number of distinct drift stations needed to fit a sloped drift line.
 # With fewer, a constant (mean) offset is removed instead.
 DRIFT_MIN_STATIONS_FOR_FIT = 2
@@ -616,16 +619,18 @@ def process_code(
         drift_corrs = np.empty((0, 5), dtype=float)
         spmv_corr = {seg_id: segments[seg_id]["SPmV"].copy() for seg_id in segment_ids}
 
-    # Simple inter-segment shifting analogous to original code
-    if len(segment_ids) >= 1:
+    # Inter-segment referencing (optional; independent of drift correction)
+    if ZERO_FIRST_SEGMENT and segment_ids:
         first = segment_ids[0]
         spmv_corr[first] = spmv_corr[first] - spmv_corr[first][0]
 
-    for i in range(1, len(segment_ids)):
-        prev = segment_ids[i - 1]
-        curr = segment_ids[i]
-        shift = spmv_corr[curr][0] - spmv_corr[prev][-1]
-        spmv_corr[curr] = spmv_corr[curr] - shift
+    if TIE_SEGMENTS:
+        for i in range(1, len(segment_ids)):
+            prev = segment_ids[i - 1]
+            curr = segment_ids[i]
+            shift = spmv_corr[curr][0] - spmv_corr[prev][-1]
+            spmv_corr[curr] = spmv_corr[curr] - shift
+            print(f"Segment {curr}: tie-in shift {shift:+.3f} mV")
 
     # Build concatenated SP series: first pair and second pair, if available
     if len(segment_ids) >= 2:

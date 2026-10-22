@@ -1,12 +1,12 @@
 [paths]
-input_dir = 'C:\Users\CND367\Documents\WaSP\test2_nd'
-processed_dir = 'C:\Users\CND367\Documents\WaSP\test2_nd\processed'
-figures_dir = 'C:\Users\CND367\Documents\WaSP\test2_nd\figures'
+input_dir = 'C:\Users\CND367\Documents\WaSP\jeff_20261020'
+processed_dir = 'C:\Users\CND367\Documents\WaSP\jeff_20261020\processed'
+figures_dir = 'C:\Users\CND367\Documents\WaSP\jeff_20261020\figures'
 
 [files]
-sp_data = 'formatted_self_potential.csv'
+sp_data = 'formatted_SP_data.csv'
 drift_data = ''
-temp_cond_data = 'formatted_conductivity.csv'
+temp_cond_data = ''
 hfem_resistivity = ''
 
 [processing]
@@ -14,3 +14,5 @@ dipole_length_m = 0.5
 gaussian_sigma = 30
 boxcar_m = 5
 boxcar_iterations = 1
+zero_first_segment = false   # subtract first reading of segment 1
+tie_segments = false         # shift each segment to match the previous one's end

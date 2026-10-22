@@ -499,8 +499,8 @@ def make_map(
         vmin=lo,
         vmax=hi,
         s=MARKER_SIZE,
-        edgecolors="black",
-        linewidths=0.3,
+        edgecolors="none",
+        linewidths=0,
         zorder=5,
     )
 

@@ -1,18 +1,19 @@
 import pandas as pd
+from pathlib import Path
 
 
 # =============================================================================
 # USER SETTINGS - EDIT THESE
 # =============================================================================
+RAW_DIRECTORY = Path(r'C:\Users\CND367\Documents\WaSP\Hysham_202609\yid\raw')
+ARROW_FILE = RAW_DIRECTORY / 'arrow_log_all.csv'
+VOLTAGE_FILE = RAW_DIRECTORY / 'voltage_all.csv'
+CONDUCTIVITY_FILE = RAW_DIRECTORY / 'conductivity_raw.csv'
 
-ARROW_FILE = r"C:\Users\CND367\Documents\WaSP\test2\raw\arrow_log_20260731.csv"
-VOLTAGE_FILE = r"C:\Users\CND367\Documents\WaSP\test2\raw\voltage_log.csv"
-CONDUCTIVITY_FILE = r"C:\Users\CND367\Documents\WaSP\test2\raw\conductivity.csv"
-
-SP_OUTPUT_FILE = r"C:\Users\CND367\Documents\WaSP\test2\formatted_self_potential.csv"
-VDRIFT_OUTPUT_FILE = r"C:\Users\CND367\Documents\WaSP\test2\drift_self_potential.csv"
-CONDUCTIVITY_OUTPUT_FILE = r"C:\Users\CND367\Documents\WaSP\test2\formatted_conductivity.csv"
-
+PROC_DIRECTORY = Path(r'C:\Users\CND367\Documents\WaSP\Hysham_202609\yid')
+SP_OUTPUT_FILE = PROC_DIRECTORY / 'formatted_SP_data.csv'
+VDRIFT_OUTPUT_FILE = PROC_DIRECTORY / 'formatted_VDrift.csv'
+CONDUCTIVITY_OUTPUT_FILE = PROC_DIRECTORY / 'formatted_conductivity.csv'
 # Choose which Arrow timestamp column to use:
 #   "utc"   -> use pc_utc_time and convert to local time
 #   "local" -> use pc_local_time directly
@@ -25,7 +26,7 @@ UTC_TO_LOCAL_HOURS = -6 if TIMEZONE == "MDT" else -7
 # These are mm:ss.s and roll over every hour, so they are unwrapped in file order.
 # Set this to the FULL LOCAL datetime of the FIRST voltage record AS IT APPEARS
 # IN THE FILE (first row, not the earliest sorted value).
-VOLTAGE_START_LOCAL_DATETIME = "2026-07-31 11:25:32"
+VOLTAGE_START_LOCAL_DATETIME = "9/3/2026 10:32:43.321"
 
 # Optional extra manual time shifts
 GNSS_TIME_OFFSET_SECONDS = 0.0
@@ -37,7 +38,6 @@ MAX_TIME_DIFF_SECONDS = 2.0
 SEGMENT_ID = 1
 SEGMENT_START_LOCATION = "Unknown Start"
 SEGMENT_END_LOCATION = "Unknown End"
-
 
 # =============================================================================
 # FUNCTIONS
@@ -137,11 +137,6 @@ def parse_elapsed_mmss(value):
 
 
 def read_voltage_data(path):
-    """
-    Reads the voltage log. The 'Time' column holds wall-clock mm:ss.s values that
-    wrap every hour, so rows are processed in FILE ORDER and each decrease in the
-    mm:ss value is treated as an hour rollover.
-    """
     df = pd.read_csv(path, encoding="utf-8-sig")
 
     required = ["Time", "Reading"]
@@ -151,40 +146,23 @@ def read_voltage_data(path):
 
     df = df.copy()
 
-    # Do NOT sort here - file order carries the hour rollover information.
-    df["mmss_seconds"] = df["Time"].apply(parse_elapsed_mmss)
+    df["timestamp"] = pd.to_datetime(
+        df["Time"].astype(str).str.strip(),
+        format="%m/%d/%Y %H:%M:%S.%f",
+        errors="coerce"
+    )
     df["Reading"] = pd.to_numeric(df["Reading"], errors="coerce")
 
-    df = df.dropna(subset=["mmss_seconds", "Reading"]).reset_index(drop=True)
+    df = df.dropna(subset=["timestamp", "Reading"]).reset_index(drop=True)
 
     if df.empty:
         raise ValueError("No valid voltage time/reading rows found.")
 
-    # Unwrap hour rollovers: each time the mm:ss value decreases, add 3600 s.
-    elapsed = []
-    wraps = 0
-    prev = None
-    for v in df["mmss_seconds"]:
-        if prev is not None and v < prev - 1.0:   # 1 s guard against jitter
-            wraps += 1
-        elapsed.append(v + 3600.0 * wraps)
-        prev = v
-
-    df["elapsed_seconds"] = elapsed
-
-    start_local = pd.to_datetime(VOLTAGE_START_LOCAL_DATETIME, errors="raise")
-    first_elapsed = df["elapsed_seconds"].iloc[0]
-
     df["timestamp"] = (
-        start_local
-        + pd.to_timedelta(df["elapsed_seconds"] - first_elapsed, unit="s")
-        + pd.to_timedelta(VOLTAGE_TIME_OFFSET_SECONDS, unit="s")
+        df["timestamp"] + pd.to_timedelta(VOLTAGE_TIME_OFFSET_SECONDS, unit="s")
     )
-
     df["timestamp"] = pd.to_datetime(df["timestamp"]).astype("datetime64[ns]")
     df = df.sort_values("timestamp").reset_index(drop=True)
-
-    print(f"Voltage hour rollovers detected: {wraps}")
 
     return df[["timestamp", "Reading"]].rename(
         columns={"Reading": "Measured_Voltage_millivolts"}
